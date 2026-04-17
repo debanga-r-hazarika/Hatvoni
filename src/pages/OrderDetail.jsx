@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { velocityTrackingPageUrl } from '../lib/velocityTracking';
+import { isLikelyTrackingId, velocityTrackingPageUrl } from '../lib/velocityTracking';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { cartService } from '../services/cartService';
@@ -50,6 +50,30 @@ const humanizeShipmentStatus = (raw) => {
   return raw.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 };
 
+/** Prefer DB column (webhooks + sync), then last API snapshot JSON */
+function resolveLatestCarrierStatus(order, trackingSnap) {
+  const direct = order?.shipment_status;
+  if (direct && String(direct).trim()) return humanizeShipmentStatus(String(direct));
+  if (!trackingSnap || typeof trackingSnap !== 'object') return '';
+  const snap = trackingSnap;
+  const fromTd = snap.tracking_data && typeof snap.tracking_data === 'object'
+    ? snap.tracking_data.shipment_status
+    : null;
+  const top = snap.shipment_status;
+  return humanizeShipmentStatus(String(fromTd || top || ''));
+}
+
+function formatRelativeShort(iso) {
+  if (!iso) return '';
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return '';
+  const sec = Math.floor((Date.now() - t) / 1000);
+  if (sec < 45) return 'just now';
+  if (sec < 3600) return `${Math.floor(sec / 60)} min ago`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)} hr ago`;
+  return formatDate(iso);
+}
+
 /* ── helpers ── */
 function resolveCustomerStatus(order) {
   if (!order) return 'placed';
@@ -78,15 +102,16 @@ export default function OrderDetail() {
   const [cancelReason, setCancelReason] = useState('');
   const [showCancelModal, setShowCancelModal] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [trackingEmbedLoaded, setTrackingEmbedLoaded] = useState(false);
 
   /* fetch + realtime */
   useEffect(() => {
     if (authLoading) return;
     if (!user) { navigate('/login'); return; }
 
-    const fetchOrder = async () => {
+    const fetchOrder = async (silentRefetch = false) => {
       try {
-        setLoading(true);
+        if (!silentRefetch) setLoading(true);
         const { data, error: e } = await supabase
           .from('orders')
           .select('*, order_items(*, products(*), lots(*))')
@@ -98,19 +123,23 @@ export default function OrderDetail() {
       } catch (err) {
         setError(err.message || 'Unable to load order details');
       } finally {
-        setLoading(false);
+        if (!silentRefetch) setLoading(false);
       }
     };
 
-    fetchOrder();
+    fetchOrder(false);
 
     const ch = supabase
       .channel('customer-order-' + id)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'orders', filter: `id=eq.${id}` }, () => fetchOrder())
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'orders', filter: `id=eq.${id}` }, () => fetchOrder(true))
       .subscribe();
 
     return () => supabase.removeChannel(ch);
   }, [authLoading, id, navigate, user]);
+
+  useEffect(() => {
+    setTrackingEmbedLoaded(false);
+  }, [order?.tracking_number]);
 
   /* derived data */
   const displayStatus = useMemo(() => resolveCustomerStatus(order), [order]);
@@ -268,6 +297,10 @@ export default function OrderDetail() {
     ? trackingSnap.shipment_track_activities
     : [];
 
+  const latestCarrierLabel = resolveLatestCarrierStatus(order, trackingSnap);
+  const trackingEmbedOk = !!(order?.tracking_number && isLikelyTrackingId(order.tracking_number));
+  const trackingEmbedSrc = trackingEmbedOk ? velocityTrackingPageUrl(order.tracking_number) : '';
+
   /* ═══════════════════════ RENDER ═══════════════════════ */
   return (
     <main className="pt-28 pb-20 md:pt-36 md:pb-16 bg-surface min-h-screen">
@@ -388,47 +421,90 @@ export default function OrderDetail() {
               <div className="bg-white rounded-xl border border-outline-variant/15 p-4">
                 {/* Tracking info */}
                 {order.tracking_number && (
-                  <div className="mb-3 pb-3 border-b border-outline-variant/10 space-y-2">
-                    <div className="rounded-xl border border-secondary/15 bg-gradient-to-br from-secondary/5 to-primary/[0.02] p-3 mb-3 -mt-1">
-                      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-                        <div>
-                          <p className="text-[10px] font-bold uppercase tracking-wider text-secondary font-body">Live carrier page</p>
-                          <p className="text-xs text-on-surface-variant font-body mt-0.5">
-                            Full tracking, delivery date &amp; order breakdown on Velocity.
+                  <div className="mb-3 pb-3 border-b border-outline-variant/10 space-y-4">
+                    {/* Latest status — orders.shipment_status updated by Velocity webhooks + orchestrator */}
+                    <div className="rounded-2xl border border-primary/15 bg-gradient-to-br from-primary/[0.06] via-white to-secondary/[0.04] p-4 shadow-sm">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2 mb-2">
+                            <span className="relative flex h-2 w-2 shrink-0">
+                              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+                            </span>
+                            <p className="text-[10px] font-black uppercase tracking-[0.18em] text-primary font-body">
+                              Live carrier status · Velocity
+                            </p>
+                          </div>
+                          <p className="font-headline text-xl sm:text-2xl font-bold text-primary leading-snug">
+                            {latestCarrierLabel || 'Carrier will update status when your package is scanned'}
+                          </p>
+                          <p className="text-[11px] text-on-surface-variant font-body mt-2">
+                            {order.updated_at && (
+                              <>
+                                Last update <span className="font-semibold text-on-surface">{formatRelativeShort(order.updated_at)}</span>
+                                <span className="text-on-surface-variant/70"> · </span>
+                              </>
+                            )}
+                            Refreshes automatically when Velocity sends webhook updates to our store.
                           </p>
                         </div>
                         <div className="flex flex-wrap gap-2 shrink-0">
                           <Link
                             to={`/track/${encodeURIComponent(order.tracking_number)}`}
-                            className="inline-flex items-center justify-center gap-2 rounded-xl bg-secondary text-on-secondary px-4 py-2.5 text-xs font-bold font-headline shadow-sm hover:opacity-95 transition-opacity"
+                            className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-secondary text-on-secondary px-3 py-2 text-[11px] font-bold font-headline hover:opacity-95 transition-opacity"
                           >
-                            <span className="material-symbols-outlined text-[18px]">travel_explore</span>
-                            View tracking page
+                            <span className="material-symbols-outlined text-[16px]">open_in_full</span>
+                            Full-page track
                           </Link>
                           <a
                             href={velocityTrackingPageUrl(order.tracking_number)}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-outline-variant/35 bg-white px-3 py-2.5 text-xs font-bold text-primary hover:bg-surface-container-low transition-colors"
+                            className="inline-flex items-center justify-center gap-1 rounded-xl border border-outline-variant/35 bg-white px-3 py-2 text-[11px] font-bold text-primary hover:bg-surface-container-low"
                           >
                             <span className="material-symbols-outlined text-[16px]">open_in_new</span>
-                            Velocity site
+                            New tab
                           </a>
                         </div>
                       </div>
                     </div>
+
+                    {/* Branded Velocity tracking (iframe) */}
+                    {trackingEmbedOk && trackingEmbedSrc && (
+                      <div className="rounded-2xl border border-outline-variant/25 overflow-hidden bg-surface-container-low/50 shadow-[0_12px_40px_rgba(0,74,43,0.06)]">
+                        <div className="flex flex-wrap items-center justify-between gap-2 px-3 sm:px-4 py-2.5 border-b border-outline-variant/15 bg-white/80">
+                          <p className="text-[11px] font-bold text-on-surface font-headline flex items-center gap-1.5">
+                            <span className="material-symbols-outlined text-secondary text-[18px]">map</span>
+                            Track your shipment (Hatvoni on Velocity)
+                          </p>
+                          <p className="text-[10px] text-on-surface-variant/80">
+                            If this area is blank, use <strong>New tab</strong> — some browsers block embedded carrier pages.
+                          </p>
+                        </div>
+                        <div className="relative bg-white min-h-[min(420px,52vh)] md:min-h-[min(520px,56vh)]">
+                          {!trackingEmbedLoaded && (
+                            <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-surface-container-low/70 backdrop-blur-[1px]">
+                              <span className="material-symbols-outlined text-3xl text-secondary animate-spin">progress_activity</span>
+                              <span className="text-xs font-semibold text-on-surface-variant font-body">Loading tracking…</span>
+                            </div>
+                          )}
+                          <iframe
+                            title="Velocity shipment tracking"
+                            src={trackingEmbedSrc}
+                            className="w-full min-h-[min(420px,52vh)] md:min-h-[min(520px,56vh)] border-0 block bg-white"
+                            onLoad={() => setTrackingEmbedLoaded(true)}
+                            referrerPolicy="no-referrer-when-downgrade"
+                          />
+                        </div>
+                      </div>
+                    )}
+
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="material-symbols-outlined text-[16px] text-secondary shrink-0">local_shipping</span>
                       <span className="text-xs font-semibold text-on-surface-variant font-body">
                         {order.shipment_provider || 'Courier'} · <span className="font-mono text-primary">{order.tracking_number}</span>
                       </span>
                     </div>
-                    {order.shipment_status && (
-                      <p className="text-[11px] text-on-surface-variant font-body pl-7">
-                        Carrier status:{' '}
-                        <span className="font-semibold text-on-surface">{humanizeShipmentStatus(order.shipment_status)}</span>
-                      </p>
-                    )}
                     {order.velocity_tracking_url && (
                       <div className="pl-7">
                         <a
@@ -438,7 +514,7 @@ export default function OrderDetail() {
                           className="inline-flex items-center gap-1 text-xs font-bold text-secondary hover:underline underline-offset-2 font-body"
                         >
                           <span className="material-symbols-outlined text-[14px]">open_in_new</span>
-                          Alternative tracking link
+                          Carrier tracking link
                         </a>
                       </div>
                     )}

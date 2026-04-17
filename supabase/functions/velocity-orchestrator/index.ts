@@ -1636,11 +1636,16 @@ async function handleCancelOrder(
 
   const { data: row, error: rowErr } = await adminClient
     .from('orders')
-    .select('id, tracking_number, velocity_awb, velocity_pending_shipment_id')
+    .select('id, status, tracking_number, velocity_awb, velocity_pending_shipment_id, velocity_shipment_id')
     .eq('id', internalOrderId)
     .maybeSingle();
 
   if (rowErr || !row) throw new Error('Order not found');
+
+  const orderStatus = String(row.status || '').toLowerCase();
+  if (orderStatus === 'delivered') {
+    throw new Error('Cannot cancel shipment after delivery.');
+  }
 
   const awb = String(row.tracking_number || row.velocity_awb || '').trim();
   const pending = String(payload.shipment_id || row.velocity_pending_shipment_id || '').trim();
@@ -1677,7 +1682,22 @@ async function handleCancelOrder(
       admin_updated_at: nowIso(),
     };
     if (awb) {
+      /**
+       * Velocity POST /cancel-order with `awbs[]` cancels the forward shipment (pickup / manifest).
+       * Revert storefront order so staff can book a new shipment (Velocity Custom API cancel-order).
+       */
       patch.shipment_status = 'cancelled';
+      patch.status = 'processing';
+      patch.customer_status = 'processing';
+      patch.tracking_number = null;
+      patch.velocity_awb = null;
+      patch.velocity_shipment_id = null;
+      patch.velocity_label_url = null;
+      patch.velocity_carrier_name = null;
+      patch.velocity_tracking_url = null;
+      patch.velocity_tracking_snapshot = null;
+      patch.shipment_provider = null;
+      patch.shipped_at = null;
     }
     if (row.velocity_pending_shipment_id) {
       patch.velocity_pending_shipment_id = null;

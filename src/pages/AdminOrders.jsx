@@ -1329,6 +1329,7 @@ function ShippingPanel({ order, orderId, onRefresh, onNotice, onError }) {
   const [trackingVelocity, setTrackingVelocity] = useState(false);
   const [syncingVelTrack, setSyncingVelTrack] = useState(false);
   const [printingLabel, setPrintingLabel] = useState(false);
+  const [cancellingPickup, setCancellingPickup] = useState(false);
   const [velEnvHealth, setVelEnvHealth] = useState(null);
 
   const [retryingRefund, setRetryingRefund] = useState(false);
@@ -1339,6 +1340,27 @@ function ShippingPanel({ order, orderId, onRefresh, onNotice, onError }) {
     ? String(order.velocity_pending_shipment_id).trim()
     : '';
   const alreadyShippedViaVelocity = !!(order?.velocity_shipment_id && order?.tracking_number);
+
+  /** Before courier picks up / in transit — Velocity cancel-order (`awbs[]`) cancels shipment & pickup booking. */
+  const shipmentLc = String(order?.shipment_status || '').toLowerCase();
+  const pickupCancelBlocked = new Set([
+    'in_transit',
+    'out_for_delivery',
+    'picked_up',
+    'picked',
+    'picked up',
+    'dispatch',
+    'dispatched',
+    'delivered',
+    'cancelled',
+    'rto_delivered',
+    'lost',
+  ]);
+  const showCancelPickup =
+    alreadyShippedViaVelocity &&
+    !!(order?.tracking_number || order?.velocity_awb) &&
+    order?.status !== 'cancelled' &&
+    !pickupCancelBlocked.has(shipmentLc);
   // Show retry button when refund is pending (was set by admin_finalize_order but edge fn wasn't deployed)
   const needsRefundRetry = isPartialOrder && isRazorpay && isPaid && order?.refund_status === 'pending';
 
@@ -1583,6 +1605,28 @@ function ShippingPanel({ order, orderId, onRefresh, onNotice, onError }) {
     }
   };
 
+  /** Cancels the forward shipment on Velocity (POST /cancel-order with `awbs[]` per API docs) and resets order for re-booking. */
+  const cancelVelocityPickup = async () => {
+    const ok = window.confirm(
+      'Cancel this shipment and pickup on Velocity? The AWB will be voided on the carrier, and this order will return to Processing so you can create a new shipment.',
+    );
+    if (!ok) return;
+    setCancellingPickup(true);
+    onError('');
+    try {
+      await callVelocityFn({ action: 'cancel_order', payload: {} });
+      onNotice('Pickup / shipment cancelled on Velocity. Order set back to processing.');
+      setEditTracking('');
+      setEditProvider('');
+      setEditStatus('processing');
+      await onRefresh();
+    } catch (e) {
+      onError(toUserError(e, 'Velocity could not cancel this shipment. It may already be in transit — check the portal.'));
+    } finally {
+      setCancellingPickup(false);
+    }
+  };
+
   // Default to Velocity when a forward-order draft exists (avoids showing manual + matches flow).
   useEffect(() => {
     if (order?.status === 'processing' && order?.velocity_pending_shipment_id) {
@@ -1807,6 +1851,8 @@ function ShippingPanel({ order, orderId, onRefresh, onNotice, onError }) {
             order.tracking_number || order.velocity_awb);
           if (velInvolved) {
             await callVelocityFn({ action: 'cancel_order', payload: {} });
+            patch.tracking_number = null;
+            patch.shipment_provider = null;
           }
         }
         patch.status = editStatus;
@@ -1896,6 +1942,7 @@ function ShippingPanel({ order, orderId, onRefresh, onNotice, onError }) {
                 disabled={
                   printingLabel ||
                   syncingVelTrack ||
+                  cancellingPickup ||
                   !(order.tracking_number || order.velocity_awb)
                 }
                 className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-xs font-bold text-on-primary shadow-sm hover:opacity-95 disabled:opacity-50 disabled:cursor-not-allowed"
@@ -1913,12 +1960,23 @@ function ShippingPanel({ order, orderId, onRefresh, onNotice, onError }) {
               <button
                 type="button"
                 onClick={syncVelocityTrackingFromApi}
-                disabled={syncingVelTrack || printingLabel}
+                disabled={syncingVelTrack || printingLabel || cancellingPickup}
                 className="inline-flex items-center gap-1 rounded-lg border border-blue-300 bg-white px-3 py-1.5 text-xs font-bold text-blue-800 hover:bg-blue-100 disabled:opacity-50"
               >
                 <span className="material-symbols-outlined text-sm">sync</span>
                 {syncingVelTrack ? 'Syncing…' : 'Sync from Velocity'}
               </button>
+              {showCancelPickup && (
+                <button
+                  type="button"
+                  onClick={cancelVelocityPickup}
+                  disabled={cancellingPickup || printingLabel || syncingVelTrack}
+                  className="inline-flex items-center gap-1 rounded-lg border border-red-300/90 bg-white px-3 py-1.5 text-xs font-bold text-red-800 hover:bg-red-50 disabled:opacity-50"
+                >
+                  <span className="material-symbols-outlined text-sm">cancel_schedule_send</span>
+                  {cancellingPickup ? 'Cancelling…' : 'Cancel pickup'}
+                </button>
+              )}
             </div>
             {!order.velocity_label_url && (order.tracking_number || order.velocity_awb) && (
               <p className="text-[10px] text-blue-800/85">
