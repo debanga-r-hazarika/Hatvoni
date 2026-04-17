@@ -39,6 +39,7 @@ import Support from './pages/Support';
 import Seller from './pages/Seller';
 import SellerOrderDetail from './pages/SellerOrderDetail';
 import PaymentProcessing from './pages/PaymentProcessing';
+import TrackShipment from './pages/TrackShipment';
 
 // Pages that use a minimal transactional header (no shared Navbar/Footer)
 const TRANSACTIONAL = ['/checkout', '/login', '/signup', '/forgot-password', '/reset-password', '/confirm-account'];
@@ -89,6 +90,7 @@ export default function App() {
           <Route path="/seller" element={<Layout path="/seller"><Seller /></Layout>} />
           <Route path="/seller/orders/:id" element={<Layout path="/seller/orders/:id"><SellerOrderDetail /></Layout>} />
           <Route path="/order/:id" element={<Layout path="/order/:id"><OrderDetail /></Layout>} />
+          <Route path="/track/:trackingId" element={<Layout path="/track/:trackingId"><TrackShipment /></Layout>} />
           <Route path="/wishlist" element={<Layout path="/wishlist"><Wishlist /></Layout>} />
           <Route path="/privacy-policy" element={<Layout path="/privacy-policy"><PrivacyPolicy /></Layout>} />
           <Route path="/returns-shipping" element={<Layout path="/returns-shipping"><ReturnsShipping /></Layout>} />

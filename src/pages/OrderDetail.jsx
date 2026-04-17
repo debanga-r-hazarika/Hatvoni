@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { velocityTrackingPageUrl } from '../lib/velocityTracking';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { cartService } from '../services/cartService';
@@ -41,6 +42,12 @@ const statusMeta = {
   shipped:    { icon: 'local_shipping',   label: 'Shipped',    color: 'text-blue-700' },
   delivered:  { icon: 'check_circle',     label: 'Delivered',  color: 'text-emerald-700' },
   cancelled:  { icon: 'cancel',           label: 'Cancelled',  color: 'text-red-700' },
+};
+
+/** Velocity/Shipfast granular shipment_status → readable label */
+const humanizeShipmentStatus = (raw) => {
+  if (!raw || typeof raw !== 'string') return '';
+  return raw.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 };
 
 /* ── helpers ── */
@@ -254,6 +261,13 @@ export default function OrderDetail() {
   const completedSteps = timeline.filter(t => t.done).length;
   const progressPct    = timeline.length ? Math.round((completedSteps / timeline.length) * 100) : 0;
 
+  const trackingSnap = order?.velocity_tracking_snapshot && typeof order.velocity_tracking_snapshot === 'object'
+    ? order.velocity_tracking_snapshot
+    : null;
+  const trackActivities = Array.isArray(trackingSnap?.shipment_track_activities)
+    ? trackingSnap.shipment_track_activities
+    : [];
+
   /* ═══════════════════════ RENDER ═══════════════════════ */
   return (
     <main className="pt-28 pb-20 md:pt-36 md:pb-16 bg-surface min-h-screen">
@@ -374,11 +388,75 @@ export default function OrderDetail() {
               <div className="bg-white rounded-xl border border-outline-variant/15 p-4">
                 {/* Tracking info */}
                 {order.tracking_number && (
-                  <div className="flex items-center gap-2 mb-3 pb-3 border-b border-outline-variant/10">
-                    <span className="material-symbols-outlined text-[16px] text-secondary">local_shipping</span>
-                    <span className="text-xs font-semibold text-on-surface-variant font-body">
-                      {order.shipment_provider || 'AWB'}: <span className="font-mono text-primary">{order.tracking_number}</span>
-                    </span>
+                  <div className="mb-3 pb-3 border-b border-outline-variant/10 space-y-2">
+                    <div className="rounded-xl border border-secondary/15 bg-gradient-to-br from-secondary/5 to-primary/[0.02] p-3 mb-3 -mt-1">
+                      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                        <div>
+                          <p className="text-[10px] font-bold uppercase tracking-wider text-secondary font-body">Live carrier page</p>
+                          <p className="text-xs text-on-surface-variant font-body mt-0.5">
+                            Full tracking, delivery date &amp; order breakdown on Velocity.
+                          </p>
+                        </div>
+                        <div className="flex flex-wrap gap-2 shrink-0">
+                          <Link
+                            to={`/track/${encodeURIComponent(order.tracking_number)}`}
+                            className="inline-flex items-center justify-center gap-2 rounded-xl bg-secondary text-on-secondary px-4 py-2.5 text-xs font-bold font-headline shadow-sm hover:opacity-95 transition-opacity"
+                          >
+                            <span className="material-symbols-outlined text-[18px]">travel_explore</span>
+                            View tracking page
+                          </Link>
+                          <a
+                            href={velocityTrackingPageUrl(order.tracking_number)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-outline-variant/35 bg-white px-3 py-2.5 text-xs font-bold text-primary hover:bg-surface-container-low transition-colors"
+                          >
+                            <span className="material-symbols-outlined text-[16px]">open_in_new</span>
+                            Velocity site
+                          </a>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="material-symbols-outlined text-[16px] text-secondary shrink-0">local_shipping</span>
+                      <span className="text-xs font-semibold text-on-surface-variant font-body">
+                        {order.shipment_provider || 'Courier'} · <span className="font-mono text-primary">{order.tracking_number}</span>
+                      </span>
+                    </div>
+                    {order.shipment_status && (
+                      <p className="text-[11px] text-on-surface-variant font-body pl-7">
+                        Carrier status:{' '}
+                        <span className="font-semibold text-on-surface">{humanizeShipmentStatus(order.shipment_status)}</span>
+                      </p>
+                    )}
+                    {order.velocity_tracking_url && (
+                      <div className="pl-7">
+                        <a
+                          href={order.velocity_tracking_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-xs font-bold text-secondary hover:underline underline-offset-2 font-body"
+                        >
+                          <span className="material-symbols-outlined text-[14px]">open_in_new</span>
+                          Alternative tracking link
+                        </a>
+                      </div>
+                    )}
+                    {trackActivities.length > 0 && (
+                      <ul className="mt-2 space-y-1.5 pl-7 border-t border-outline-variant/10 pt-3 max-h-48 overflow-y-auto">
+                        {trackActivities.slice(0, 12).map((ev, idx) => (
+                          <li key={`${ev.date || ''}-${idx}`} className="text-[11px] font-body leading-snug text-on-surface-variant">
+                            {ev.date && (
+                              <span className="text-on-surface-variant/70 font-mono text-[10px] mr-2">
+                                {String(ev.date).slice(0, 16)}
+                              </span>
+                            )}
+                            <span className="font-semibold text-on-surface">{ev.activity || ev.description || 'Update'}</span>
+                            {ev.location ? <span className="text-on-surface-variant/80"> · {ev.location}</span> : null}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
                   </div>
                 )}
 

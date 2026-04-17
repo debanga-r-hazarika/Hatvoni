@@ -3,8 +3,10 @@ export const VELOCITY_ACTIONS = [
   'check_serviceability',
   'calculate_rates',
   'create_order',
+  'create_forward_order',
   'assign_courier',
   'cancel_order',
+  'cancel_velocity_draft',
   'track_order',
   'get_reports',
   'list_shipments',
@@ -12,6 +14,7 @@ export const VELOCITY_ACTIONS = [
   'initiate_return',
   'assign_return_courier',
   'webhook_update',
+  'webhook_health',
 ] as const;
 
 export type VelocityAction = (typeof VELOCITY_ACTIONS)[number];
@@ -64,15 +67,28 @@ export function validatePayloadForAction(action: VelocityAction, payload: Record
     case 'create_order':
       if (!hasString('order_id')) return 'create_order requires payload.order_id';
       return null;
-    case 'assign_courier':
-      if (!(hasString('order_id') || hasString('shipment_id'))) {
-        return 'assign_courier requires payload.order_id or payload.shipment_id';
+    case 'create_forward_order': {
+      if (!hasString('order_id')) return 'create_forward_order requires payload.order_id';
+      if (!hasString('pickup_location_id')) {
+        return 'create_forward_order requires payload.pickup_location_id (synced seller pickup location)';
+      }
+      const dims = ['length', 'breadth', 'height', 'weight'] as const;
+      for (const k of dims) {
+        const n = Number(payload[k]);
+        if (!Number.isFinite(n) || n <= 0) {
+          return `create_forward_order requires a positive number for payload.${k} (cm / kg per Velocity API)`;
+        }
       }
       return null;
+    }
+    case 'assign_courier':
+      if (!hasString('order_id')) return 'assign_courier requires payload.order_id';
+      return null;
     case 'cancel_order':
-      if (!(hasString('order_id') || hasString('shipment_id'))) {
-        return 'cancel_order requires payload.order_id or payload.shipment_id';
-      }
+      if (!hasString('order_id')) return 'cancel_order requires payload.order_id';
+      return null;
+    case 'cancel_velocity_draft':
+      if (!hasString('order_id')) return 'cancel_velocity_draft requires payload.order_id';
       return null;
     case 'track_order':
       if (!(hasString('order_id') || hasString('awb') || hasString('tracking_number') || hasString('shipment_id'))) {
@@ -85,6 +101,7 @@ export function validatePayloadForAction(action: VelocityAction, payload: Record
     case 'initiate_return':
     case 'assign_return_courier':
     case 'webhook_update':
+    case 'webhook_health':
       return null;
     default:
       return 'Invalid action payload';

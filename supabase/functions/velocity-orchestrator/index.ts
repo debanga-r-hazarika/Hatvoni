@@ -3,7 +3,8 @@ import { parseActionRequest, validatePayloadForAction, type VelocityAction } fro
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-velocity-webhook-secret',
+  'Access-Control-Allow-Headers':
+    'authorization, x-client-info, apikey, content-type, x-velocity-webhook-secret, x-api-key',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 };
 
@@ -45,6 +46,43 @@ function safeJsonParse(text: string): unknown {
   }
 }
 
+function looksLikeHttpUrl(s: string): boolean {
+  const t = s.trim();
+  return t.length > 10 && /^https?:\/\//i.test(t);
+}
+
+/**
+ * Velocity/Shipfast responses vary: `label_url`, `shipping_label_url`, nested under `payload`, etc.
+ * Used when persisting `orders.velocity_label_url` after assign courier / tracking / webhooks.
+ */
+function extractVelocityLabelUrl(source: Record<string, unknown>, depth = 0): string | null {
+  if (depth > 6) return null;
+  const keys = [
+    'label_url',
+    'shipping_label_url',
+    'label_pdf_url',
+    'courier_label_url',
+    'awb_label_url',
+    'label_print_url',
+    'manifest_url',
+    'pdf_url',
+    'shipping_label',
+  ];
+  for (const k of keys) {
+    const v = source[k];
+    if (typeof v === 'string' && looksLikeHttpUrl(v)) return v.trim();
+  }
+  const nestedKeys = ['data', 'payload', 'result', 'shipment', 'tracking_data'];
+  for (const nk of nestedKeys) {
+    const n = source[nk];
+    if (n && typeof n === 'object' && !Array.isArray(n)) {
+      const inner = extractVelocityLabelUrl(n as Record<string, unknown>, depth + 1);
+      if (inner) return inner;
+    }
+  }
+  return null;
+}
+
 function parseExpiryToMs(raw: unknown): number {
   if (!raw) return Date.now() + 23 * 60 * 60 * 1000;
   if (typeof raw === 'number') return raw > 1e12 ? raw : raw * 1000;
@@ -67,7 +105,11 @@ function getBearerToken(req: Request): string | null {
   return parts.length === 2 && parts[0].toLowerCase() === 'bearer' ? parts[1] : null;
 }
 
-async function requireAdmin(
+/**
+ * Matches Admin Orders route: `isAdmin || hasModule('orders')`.
+ * Full admins always allowed; staff need active employees row + `orders` in employee_modules.
+ */
+async function requireOrdersStaffOrAdmin(
   req: Request,
   adminClient: ReturnType<typeof createAdminClient>,
 ): Promise<{ ok: true; userId: string } | { ok: false; response: Response }> {
@@ -99,10 +141,44 @@ async function requireAdmin(
     .eq('id', user.id)
     .maybeSingle();
 
-  if (!profile?.is_admin) {
+  if (profile?.is_admin) {
+    return { ok: true, userId: user.id };
+  }
+
+  const { data: empRow } = await adminClient
+    .from('employees')
+    .select('id')
+    .eq('profile_id', user.id)
+    .eq('is_active', true)
+    .maybeSingle();
+
+  if (!empRow?.id) {
     return {
       ok: false,
-      response: new Response(JSON.stringify({ error: 'Admin access required' }), {
+      response: new Response(JSON.stringify({
+        error: 'Admin or staff with Orders module access required',
+      }), {
+        status: 403,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      }),
+    };
+  }
+
+  const { data: modRows } = await adminClient
+    .from('employee_modules')
+    .select('module')
+    .eq('employee_id', empRow.id);
+
+  const hasOrders = (modRows || []).some((r) =>
+    String(r.module || '').trim().toLowerCase() === 'orders'
+  );
+
+  if (!hasOrders) {
+    return {
+      ok: false,
+      response: new Response(JSON.stringify({
+        error: 'Orders module access required for Velocity actions',
+      }), {
         status: 403,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       }),
@@ -127,8 +203,10 @@ function getEndpointMap(baseUrl: string): Record<VelocityAction, string> {
     check_serviceability: endpoint('/custom/api/v1/serviceability', 'VELOCITY_ENDPOINT_SERVICEABILITY'),
     calculate_rates: endpoint('/custom/api/v1/rates', 'VELOCITY_ENDPOINT_RATES'),
     create_order: endpoint('/custom/api/v1/forward-order-orchestration', 'VELOCITY_ENDPOINT_FORWARD_ORDER'),
+    create_forward_order: endpoint('/custom/api/v1/forward-order', 'VELOCITY_ENDPOINT_FORWARD_ORDER_CREATE'),
     assign_courier: endpoint('/custom/api/v1/forward-order-shipment', 'VELOCITY_ENDPOINT_FORWARD_ORDER_SHIPMENT'),
     cancel_order: endpoint('/custom/api/v1/cancel-order', 'VELOCITY_ENDPOINT_CANCEL_ORDER'),
+    cancel_velocity_draft: endpoint('/custom/api/v1/cancel-order', 'VELOCITY_ENDPOINT_CANCEL_ORDER'),
     track_order: endpoint('/custom/api/v1/order-tracking', 'VELOCITY_ENDPOINT_ORDER_TRACKING'),
     get_reports: endpoint('/custom/api/v1/reports', 'VELOCITY_ENDPOINT_REPORTS'),
     list_shipments: endpoint('/custom/api/v1/shipments', 'VELOCITY_ENDPOINT_SHIPMENTS'),
@@ -136,6 +214,8 @@ function getEndpointMap(baseUrl: string): Record<VelocityAction, string> {
     initiate_return: endpoint('/custom/api/v1/reverse-order', 'VELOCITY_ENDPOINT_REVERSE_ORDER'),
     assign_return_courier: endpoint('/custom/api/v1/reverse-order-shipment', 'VELOCITY_ENDPOINT_REVERSE_ORDER_SHIPMENT'),
     webhook_update: endpoint('/custom/api/v1/order-tracking', 'VELOCITY_ENDPOINT_ORDER_TRACKING'),
+    /** Not a Velocity HTTP route — satisfied for typing; handled before endpoint resolution. */
+    webhook_health: `${baseUrl}/`,
   };
 }
 
@@ -279,12 +359,65 @@ async function callVelocityApi(
   };
 }
 
-function pickOrderTrackingFromResponse(data: unknown): { shipmentStatus?: string; awb?: string } {
-  if (!data || typeof data !== 'object') return {};
-  const source = data as Record<string, unknown>;
-  const payload = (source.payload && typeof source.payload === 'object')
-    ? source.payload as Record<string, unknown>
-    : source;
+/** Parsed from Velocity POST /custom/api/v1/order-tracking (awbs[]) — see API doc §7. */
+interface TrackingPick {
+  shipmentStatus?: string;
+  awb?: string;
+  trackUrl?: string;
+  labelUrl?: string;
+  snapshot?: Record<string, unknown>;
+}
+
+function pickOrderTrackingFromResponse(data: unknown): TrackingPick {
+  const out: TrackingPick = {};
+  if (!data || typeof data !== 'object') return out;
+  const root = data as Record<string, unknown>;
+
+  const unwrapPayload = (): Record<string, unknown> => {
+    const payload = root.payload && typeof root.payload === 'object'
+      ? root.payload as Record<string, unknown>
+      : root;
+    return payload;
+  };
+
+  const payload = unwrapPayload();
+  const result = payload.result && typeof payload.result === 'object'
+    ? payload.result as Record<string, unknown>
+    : null;
+
+  if (result && Object.keys(result).length > 0) {
+    const firstAwb = Object.keys(result)[0];
+    out.awb = firstAwb;
+    const node = result[firstAwb];
+    if (node && typeof node === 'object') {
+      const nodeRec = node as Record<string, unknown>;
+      const luNode = extractVelocityLabelUrl(nodeRec);
+      if (luNode) out.labelUrl = luNode;
+      const td = nodeRec.tracking_data as Record<string, unknown> | undefined;
+      if (td && typeof td === 'object') {
+        if (typeof td.shipment_status === 'string') out.shipmentStatus = td.shipment_status;
+        if (typeof td.track_url === 'string') out.trackUrl = td.track_url;
+        const luTd = extractVelocityLabelUrl(td);
+        if (luTd) out.labelUrl = out.labelUrl || luTd;
+        const activities = td.shipment_track_activities;
+        const tracks = td.shipment_track;
+        out.snapshot = {
+          fetched_at: nowIso(),
+          shipment_status: td.shipment_status,
+          track_url: td.track_url,
+          shipment_track_activities: Array.isArray(activities) ? activities : [],
+          shipment_track: Array.isArray(tracks) ? tracks : [],
+        };
+        const firstTrack = Array.isArray(tracks) && tracks[0] && typeof tracks[0] === 'object'
+          ? tracks[0] as Record<string, unknown>
+          : null;
+        if (firstTrack && typeof firstTrack.current_status === 'string') {
+          out.shipmentStatus = out.shipmentStatus || firstTrack.current_status;
+        }
+      }
+    }
+    return out;
+  }
 
   const shipmentStatus = typeof payload.current_status === 'string'
     ? payload.current_status
@@ -294,7 +427,227 @@ function pickOrderTrackingFromResponse(data: unknown): { shipmentStatus?: string
     ? payload.awb_code
     : (typeof payload.awb === 'string' ? payload.awb : undefined);
 
-  return { shipmentStatus, awb };
+  const labelUrl = extractVelocityLabelUrl(payload);
+  return { shipmentStatus, awb, labelUrl: labelUrl || undefined };
+}
+
+/**
+ * Maps Velocity/Shipfast shipment_status → storefront `orders.status` / `customer_status`.
+ * See Shipfast guide status list + Velocity API §7 tracking statuses.
+ */
+function mergeOrderPatchFromShipmentStatus(
+  patch: Record<string, unknown>,
+  shipmentStatus: string | undefined,
+  currentOrderStatus: string | undefined,
+  opts?: { carrierReason?: string },
+): void {
+  const s = String(shipmentStatus || '').toLowerCase();
+  const cur = String(currentOrderStatus || '').toLowerCase();
+  if (!s) return;
+
+  if (cur === 'cancelled' || cur === 'rejected') return;
+
+  if (cur === 'delivered' && s !== 'delivered') {
+    return;
+  }
+
+  const inProgress = new Set([
+    'pending',
+    'processing',
+    'ready_for_pickup',
+    'pickup_scheduled',
+    'not_picked',
+    'in_transit',
+    'out_for_delivery',
+    'reattempt_delivery',
+    'externally_fulfilled',
+    'need_attention',
+    'ndr_raised',
+    'rto_initiated',
+    'rto_in_transit',
+    'rto_need_attention',
+    'rto_cancelled',
+  ]);
+
+  const terminalFail = new Set(['cancelled', 'rejected', 'lost']);
+
+  const rtoClosed = new Set(['rto_delivered']);
+
+  if (s === 'delivered') {
+    patch.status = 'delivered';
+    patch.customer_status = 'delivered';
+    patch.processed_at = patch.processed_at ?? nowIso();
+    return;
+  }
+
+  if (inProgress.has(s)) {
+    if (cur === 'placed' || cur === 'processing') {
+      patch.status = 'shipped';
+      patch.customer_status = 'shipped';
+      patch.shipped_at = patch.shipped_at ?? nowIso();
+    }
+    return;
+  }
+
+  if (terminalFail.has(s)) {
+    if (cur !== 'delivered') {
+      patch.status = 'cancelled';
+      patch.customer_status = 'cancelled';
+      const reason = opts?.carrierReason?.trim()
+        ? String(opts.carrierReason)
+        : `Shipment ${s.replace(/_/g, ' ')} (Velocity)`;
+      patch.cancellation_reason = patch.cancellation_reason ?? reason;
+    }
+    return;
+  }
+
+  if (rtoClosed.has(s)) {
+    if (cur !== 'delivered') {
+      patch.status = 'cancelled';
+      patch.customer_status = 'cancelled';
+      patch.cancellation_reason = patch.cancellation_reason ??
+        'Return to origin completed — shipment closed (Velocity)';
+    }
+  }
+}
+
+function verifyVelocityWebhookSecret(req: Request): boolean {
+  const configured = getEnvOptional('VELOCITY_WEBHOOK_SECRET');
+  if (!configured) return false;
+  const h1 = req.headers.get('x-velocity-webhook-secret') || '';
+  const h2 = req.headers.get('x-api-key') || '';
+  const bearer = getBearerToken(req) || '';
+  return configured === h1 || configured === h2 || configured === bearer;
+}
+
+/**
+ * Inbound webhook as sent by Velocity/Shipfast portal (not wrapped in { action, payload }).
+ * Docs: Shipfast Webhook Guide — event + data.order_external_id + data.status + data.tracking_url
+ */
+async function handleShipfastInboundWebhook(
+  req: Request,
+  adminClient: ReturnType<typeof createAdminClient>,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  if (!getEnvOptional('VELOCITY_WEBHOOK_SECRET')) {
+    return new Response(JSON.stringify({ error: 'Missing VELOCITY_WEBHOOK_SECRET — configure secrets for inbound webhooks' }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+
+  if (!verifyVelocityWebhookSecret(req)) {
+    return new Response(JSON.stringify({ error: 'Invalid webhook authorization' }), {
+      status: 401,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+
+  const event = typeof body.event === 'string' ? body.event : '';
+  const data = body.data && typeof body.data === 'object' ? body.data as Record<string, unknown> : null;
+  if (!data) {
+    return new Response(JSON.stringify({ error: 'Missing data object' }), {
+      status: 400,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+
+  const externalId = typeof data.order_external_id === 'string' ? data.order_external_id.trim() : '';
+  const velocityStatus = typeof data.status === 'string' ? data.status.trim() : '';
+  const shipmentType = typeof data.shipment_type === 'string' ? data.shipment_type.toLowerCase() : 'forward';
+
+  if (!externalId) {
+    await logVelocityCall(adminClient, {
+      action: 'webhook_update',
+      requestPayload: body,
+      responsePayload: { applied: false, reason: 'no_order_external_id' },
+      statusCode: 200,
+      success: true,
+      orderId: null,
+    });
+    return new Response(JSON.stringify({ ok: true, ignored: true }), {
+      status: 200,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+
+  if (shipmentType === 'return' || shipmentType === 'reverse') {
+    await logVelocityCall(adminClient, {
+      action: 'webhook_update',
+      requestPayload: body,
+      responsePayload: { applied: false, reason: 'return_shipment_skipped' },
+      statusCode: 200,
+      success: true,
+      orderId: externalId,
+    });
+    return new Response(JSON.stringify({ ok: true, ignored: true, reason: 'return_shipment' }), {
+      status: 200,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+
+  const { data: orderRow } = await adminClient
+    .from('orders')
+    .select('id, status')
+    .eq('id', externalId)
+    .maybeSingle();
+
+  const patch: Record<string, unknown> = {
+    updated_at: nowIso(),
+  };
+
+  if (velocityStatus) patch.shipment_status = velocityStatus;
+
+  const tn = typeof data.tracking_number === 'string' ? data.tracking_number.trim() : '';
+  if (tn) {
+    patch.tracking_number = tn;
+    patch.velocity_awb = tn;
+  }
+
+  const tu = typeof data.tracking_url === 'string' ? data.tracking_url.trim() : '';
+  if (tu) patch.velocity_tracking_url = tu;
+
+  const cn = typeof data.carrier_name === 'string' ? data.carrier_name.trim() : '';
+  if (cn) patch.velocity_carrier_name = cn;
+
+  const labelFromWebhook = extractVelocityLabelUrl(data);
+  if (labelFromWebhook) patch.velocity_label_url = labelFromWebhook;
+
+  const ndrReason = typeof data.ndr_reason === 'string' ? data.ndr_reason.trim() : '';
+  mergeOrderPatchFromShipmentStatus(
+    patch,
+    velocityStatus,
+    orderRow?.status as string | undefined,
+    ndrReason ? { carrierReason: ndrReason } : undefined,
+  );
+
+  if (event === 'tracking_addition' && data.new_tracking && typeof data.new_tracking === 'object') {
+    const snap = {
+      webhook_at: nowIso(),
+      event,
+      last_event: data.new_tracking,
+    };
+    patch.velocity_tracking_snapshot = snap;
+  }
+
+  const { error: upErr } = await adminClient.from('orders').update(patch).eq('id', externalId);
+  if (upErr) {
+    console.error('webhook order update', upErr);
+  }
+
+  await logVelocityCall(adminClient, {
+    action: 'webhook_update',
+    requestPayload: body,
+    responsePayload: { applied: !upErr, order_id: externalId, event },
+    statusCode: 200,
+    success: true,
+    orderId: externalId,
+  });
+
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
 }
 
 async function handleCreateWarehouse(
@@ -484,7 +837,7 @@ async function loadOrderContext(
 }> {
   const { data: order, error: orderErr } = await adminClient
     .from('orders')
-    .select('id,status,payment_method,total_amount,shipping_address,created_at,velocity_shipment_id')
+    .select('id,status,payment_method,total_amount,shipping_address,created_at,velocity_shipment_id,velocity_pending_shipment_id,velocity_fulfillment')
     .eq('id', orderId)
     .maybeSingle();
 
@@ -506,9 +859,119 @@ async function loadOrderContext(
   return { order: order as Record<string, unknown>, orderItems: (orderItems || []) as Array<Record<string, unknown>>, customerPincode };
 }
 
+function buildForwardOrderLineItems(
+  orderItems: Array<Record<string, unknown>>,
+  subTotal: number,
+): Json[] {
+  const items = orderItems.flatMap((item) => {
+    const lotSnapshot = Array.isArray(item.lot_snapshot) ? item.lot_snapshot : [];
+    if (lotSnapshot.length > 0) {
+      return lotSnapshot.map((snap) => {
+        const s = snap as Record<string, unknown>;
+        return {
+          name: String(s.product_name || s.product_key || 'Product'),
+          sku: String(s.product_key || 'SKU'),
+          units: Math.max(1, Math.round(Number(s.quantity || 1) * Number(item.quantity || 1))),
+          selling_price: Number(s.unit_price || 0),
+          discount: 0,
+          tax: 0,
+        };
+      });
+    }
+    const product = (item.products || {}) as Record<string, unknown>;
+    return [{
+      name: String(product.name || item.lot_name || 'Product'),
+      sku: String(product.key || 'SKU'),
+      units: Number(item.quantity || 1),
+      selling_price: Number(item.price || 0),
+      discount: 0,
+      tax: 0,
+    }];
+  });
+  return items.length ? items : [{ name: 'Order', sku: 'ORDER', units: 1, selling_price: subTotal, discount: 0, tax: 0 }];
+}
+
+async function fetchPickupLocationById(
+  adminClient: ReturnType<typeof createAdminClient>,
+  pickupLocationId: string,
+): Promise<Record<string, unknown> | null> {
+  const { data } = await adminClient
+    .from('seller_pickup_locations')
+    .select(
+      'id, seller_id, warehouse_name, pincode, street_address, city, state, warehouse_contact_person, warehouse_contact_number, warehouse_email_id, velocity_warehouse_id',
+    )
+    .eq('id', pickupLocationId)
+    .maybeSingle();
+  return data as Record<string, unknown> | null;
+}
+
+function readPositiveDimension(v: unknown): number | null {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+}
+
+/** Merge Velocity §3 serviceability carriers with §9 Get Rates quotes (same carrier_id). */
+function mergeServiceabilityWithRateQuotes(
+  serviceabilityCarriers: Array<Record<string, unknown>>,
+  rateCouriers: Array<Record<string, unknown>> | null,
+): Array<Record<string, unknown>> {
+  const byId = new Map<string, Record<string, unknown>>();
+  if (rateCouriers) {
+    for (const r of rateCouriers) {
+      const id = String(r.carrier_id || '').trim();
+      if (id) byId.set(id, r);
+    }
+  }
+
+  return serviceabilityCarriers.map((c) => {
+    const id = String(c.carrier_id || '').trim();
+    const q = id ? byId.get(id) : undefined;
+    if (!q) {
+      return { ...c, rate_quote: null };
+    }
+
+    const charges = (q.charges && typeof q.charges === 'object')
+      ? q.charges as Record<string, unknown>
+      : {};
+
+    const expected_delivery = (q.expected_delivery && typeof q.expected_delivery === 'object')
+      ? q.expected_delivery as Record<string, unknown>
+      : undefined;
+
+    return {
+      ...c,
+      rate_quote: {
+        charges,
+        expected_delivery: expected_delivery ?? null,
+        platform_fee: q.platform_fee ?? null,
+        service_level: typeof q.service_level === 'string' ? q.service_level : null,
+        is_fast: typeof q.is_fast === 'boolean' ? q.is_fast : null,
+        is_prime: typeof q.is_prime === 'boolean' ? q.is_prime : null,
+      },
+    };
+  });
+}
+
+function vendorDetailsFromPickupRow(row: Record<string, unknown>, pickupLocationName: string): Json {
+  return {
+    email: String(row.warehouse_email_id || ''),
+    phone: String(row.warehouse_contact_number || ''),
+    name: String(row.warehouse_contact_person || ''),
+    address: String(row.street_address || ''),
+    address_2: '',
+    city: String(row.city || ''),
+    state: String(row.state || ''),
+    country: 'India',
+    pin_code: String(row.pincode || '').replace(/\s/g, ''),
+    pickup_location: pickupLocationName,
+  };
+}
+
 async function handleCheckServiceability(
   adminClient: ReturnType<typeof createAdminClient>,
   endpoint: string,
+  ratesEndpoint: string,
   token: string,
   payload: Json,
 ) {
@@ -517,16 +980,39 @@ async function handleCheckServiceability(
   let sellerId: string | null = null;
 
   if (orderId) {
-    const fallbackPickupPincode = getEnv('VELOCITY_WAREHOUSE_PINCODE');
-    const fallbackPickupLocation = getEnvOptional('VELOCITY_PICKUP_LOCATION') || 'Main Warehouse';
     const { order, orderItems, customerPincode } = await loadOrderContext(adminClient, orderId);
-    const pickup = await resolvePickupForOrder(adminClient, orderItems, fallbackPickupLocation, fallbackPickupPincode);
-    sellerId = pickup.sellerId;
+    const pickupLocationId = typeof payload.pickup_location_id === 'string' ? payload.pickup_location_id.trim() : '';
+
+    let pickupPincode: string;
+    let pickupLocationLabel: string;
+
+    if (pickupLocationId) {
+      const row = await fetchPickupLocationById(adminClient, pickupLocationId);
+      if (!row) throw new Error('Pickup location was not found.');
+      pickupPincode = String(row.pincode || '').replace(/\s/g, '');
+      pickupLocationLabel = String(row.warehouse_name || 'Warehouse');
+      sellerId = typeof row.seller_id === 'string' ? row.seller_id : null;
+      if (!pickupPincode || pickupPincode.length !== 6) {
+        throw new Error('Pickup location pincode must be a 6-digit PIN for serviceability.');
+      }
+    } else {
+      const fallbackPickupPincode = String(getEnvOptional('VELOCITY_WAREHOUSE_PINCODE') || '').replace(/\s/g, '');
+      const fallbackPickupLocation = getEnvOptional('VELOCITY_PICKUP_LOCATION') || 'Main Warehouse';
+      const pickup = await resolvePickupForOrder(adminClient, orderItems, fallbackPickupLocation, fallbackPickupPincode);
+      pickupPincode = String(pickup.pickupPincode || '').replace(/\s/g, '');
+      pickupLocationLabel = pickup.pickupLocation;
+      sellerId = pickup.sellerId;
+      if (!pickupPincode || pickupPincode.length !== 6) {
+        throw new Error(
+          'Could not determine pickup PIN — select a synced pickup location (recommended), configure a seller default pickup with a valid 6-digit PIN, or set VELOCITY_WAREHOUSE_PINCODE.',
+        );
+      }
+    }
 
     const method = String(order.payment_method || '').toLowerCase();
     const paymentMode = ['razorpay', 'razorpay_upi', 'razorpay_cards', 'online'].includes(method) ? 'prepaid' : 'cod';
     requestPayload = {
-      from: pickup.pickupPincode,
+      from: pickupPincode,
       to: customerPincode,
       payment_mode: paymentMode,
       shipment_type: 'forward',
@@ -537,14 +1023,85 @@ async function handleCheckServiceability(
     const resultObj = (dataObj.result || {}) as Record<string, unknown>;
     const carriers = Array.isArray(resultObj.serviceability_results) ? resultObj.serviceability_results : [];
 
+    const carrierRows = carriers as Array<Record<string, unknown>>;
+    let enrichedCarriers = carrierRows;
+    let ratesShipmentDetails: unknown = null;
+    let rates_note: string | null = null;
+
+    if (apiResult.ok && carrierRows.length > 0) {
+      const L = readPositiveDimension(payload.length);
+      const W = readPositiveDimension(payload.breadth);
+      const H = readPositiveDimension(payload.height);
+      const weightKg = readPositiveDimension(payload.weight);
+
+      if (L && W && H && weightKg) {
+        const deadWeightGrams = Math.max(1, Math.round(weightKg * 1000));
+        const ratesPayload: Json = {
+          journey_type: 'forward',
+          origin_pincode: pickupPincode,
+          destination_pincode: customerPincode,
+          dead_weight: deadWeightGrams,
+          length: L,
+          width: W,
+          height: H,
+          payment_method: paymentMode,
+        };
+        if (paymentMode === 'cod') {
+          const sv = Number(order.total_amount || 0);
+          if (sv > 0) ratesPayload.shipment_value = sv;
+        }
+
+        try {
+          const ratesResult = await callVelocityApi('calculate_rates', ratesEndpoint, token, ratesPayload);
+          const rd = (ratesResult.data || {}) as Record<string, unknown>;
+          const rs = (rd.result || {}) as Record<string, unknown>;
+          const rateList = Array.isArray(rs.serviceable_couriers)
+            ? rs.serviceable_couriers as Array<Record<string, unknown>>
+            : [];
+          ratesShipmentDetails = rs.shipment_details ?? null;
+
+          if (ratesResult.ok && rateList.length > 0) {
+            enrichedCarriers = mergeServiceabilityWithRateQuotes(carrierRows, rateList);
+          } else {
+            enrichedCarriers = mergeServiceabilityWithRateQuotes(carrierRows, null);
+            if (!ratesResult.ok) {
+              rates_note = 'Could not load rate quotes; showing couriers from serviceability only.';
+            } else {
+              rates_note = 'Rates API returned no courier quotes for this shipment; showing serviceability list only.';
+            }
+          }
+
+          await logVelocityCall(adminClient, {
+            action: 'calculate_rates',
+            requestPayload: ratesPayload,
+            responsePayload: ratesResult.data,
+            statusCode: ratesResult.status,
+            success: ratesResult.ok,
+            errorMessage: ratesResult.ok ? undefined : 'Get rates failed',
+            orderId,
+            sellerId,
+          });
+        } catch {
+          enrichedCarriers = mergeServiceabilityWithRateQuotes(carrierRows, null);
+          rates_note = 'Rates request failed; showing couriers from serviceability only.';
+        }
+      } else {
+        enrichedCarriers = mergeServiceabilityWithRateQuotes(carrierRows, null);
+        rates_note = 'Add package dimensions and weight to show estimated fees and delivery dates (Velocity Get Rates API).';
+      }
+    }
+
     const transformedData = {
-      serviceable: carriers.length > 0,
-      carriers,
+      serviceable: enrichedCarriers.length > 0,
+      carriers: enrichedCarriers,
       zone: resultObj.zone || null,
       payment_mode: paymentMode,
       customer_pincode: customerPincode,
-      pickup_location: pickup.pickupLocation,
-      pickup_source: pickup.source,
+      pickup_location: pickupLocationLabel,
+      pickup_pincode: pickupPincode,
+      pickup_source: pickupLocationId ? 'selected_pickup' : 'seller_default_or_fallback',
+      rates_shipment_details: ratesShipmentDetails,
+      rates_note,
       raw: apiResult.data,
     };
 
@@ -593,14 +1150,10 @@ async function handleCreateOrder(
   let warehouseId = fallbackWarehouseId || null;
   let pickupLocationName = pickup.pickupLocation;
   let pickupPincode = pickup.pickupPincode;
+  let resolvedSellerId: string | null = pickup.sellerId;
 
   if (requestedPickupLocationId) {
-    const { data: selectedPickup } = await adminClient
-      .from('seller_pickup_locations')
-      .select('id, warehouse_name, pincode, velocity_warehouse_id')
-      .eq('id', requestedPickupLocationId)
-      .maybeSingle();
-
+    const selectedPickup = await fetchPickupLocationById(adminClient, requestedPickupLocationId);
     if (!selectedPickup) {
       throw new Error('Selected pickup location was not found.');
     }
@@ -611,6 +1164,7 @@ async function handleCreateOrder(
     warehouseId = String(selectedPickup.velocity_warehouse_id);
     pickupLocationName = String(selectedPickup.warehouse_name || pickupLocationName);
     pickupPincode = String(selectedPickup.pincode || pickupPincode);
+    resolvedSellerId = typeof selectedPickup.seller_id === 'string' ? selectedPickup.seller_id : null;
   }
 
   if (!warehouseId) {
@@ -629,31 +1183,7 @@ async function handleCreateOrder(
   const paymentMethod = ['razorpay', 'razorpay_upi', 'razorpay_cards', 'online'].includes(method) ? 'PREPAID' : 'COD';
   const subTotal = Number(order.total_amount || 0);
 
-  const items = orderItems.flatMap((item) => {
-    const lotSnapshot = Array.isArray(item.lot_snapshot) ? item.lot_snapshot : [];
-    if (lotSnapshot.length > 0) {
-      return lotSnapshot.map((snap) => {
-        const s = snap as Record<string, unknown>;
-        return {
-          name: String(s.product_name || s.product_key || 'Product'),
-          sku: String(s.product_key || 'SKU'),
-          units: Math.max(1, Math.round(Number(s.quantity || 1) * Number(item.quantity || 1))),
-          selling_price: Number(s.unit_price || 0),
-          discount: 0,
-          tax: 0,
-        };
-      });
-    }
-    const product = (item.products || {}) as Record<string, unknown>;
-    return [{
-      name: String(product.name || item.lot_name || 'Product'),
-      sku: String(product.key || 'SKU'),
-      units: Number(item.quantity || 1),
-      selling_price: Number(item.price || 0),
-      discount: 0,
-      tax: 0,
-    }];
-  });
+  const items = buildForwardOrderLineItems(orderItems, subTotal);
 
   const requestPayload: Json = {
     order_id: `HAT-${orderId.replace(/-/g, '').slice(0, 10).toUpperCase()}`,
@@ -670,7 +1200,7 @@ async function handleCreateOrder(
     billing_phone: String(addr.phone || ''),
     shipping_is_billing: true,
     print_label: true,
-    order_items: items.length ? items : [{ name: 'Order', sku: 'ORDER', units: 1, selling_price: subTotal, discount: 0, tax: 0 }],
+    order_items: items,
     payment_method: paymentMethod,
     sub_total: subTotal,
     cod_collectible: paymentMethod === 'COD' ? subTotal : 0,
@@ -694,7 +1224,7 @@ async function handleCreateOrder(
       tracking_number: String(outPayload.awb_code || ''),
       velocity_shipment_id: String(outPayload.shipment_id || ''),
       velocity_awb: String(outPayload.awb_code || ''),
-      velocity_label_url: outPayload.label_url || null,
+      velocity_label_url: extractVelocityLabelUrl(outPayload),
       velocity_carrier_name: String(outPayload.courier_name || ''),
       shipped_at: nowIso(),
       updated_at: nowIso(),
@@ -710,7 +1240,212 @@ async function handleCreateOrder(
     success: apiResult.ok,
     errorMessage: apiResult.ok ? undefined : 'Order creation failed on Velocity',
     orderId,
-    sellerId: pickup.sellerId,
+    sellerId: resolvedSellerId,
+  });
+
+  return apiResult;
+}
+
+async function handleCreateForwardOrder(
+  adminClient: ReturnType<typeof createAdminClient>,
+  endpoint: string,
+  token: string,
+  payload: Json,
+) {
+  const orderId = String(payload.order_id || '');
+  if (!orderId) throw new Error('create_forward_order requires order_id');
+
+  const pickupLocationId = String(payload.pickup_location_id || '').trim();
+  if (!pickupLocationId) throw new Error('create_forward_order requires pickup_location_id');
+
+  const length = Number(payload.length);
+  const breadth = Number(payload.breadth);
+  const height = Number(payload.height);
+  const weight = Number(payload.weight);
+
+  const { order, orderItems, customerPincode } = await loadOrderContext(adminClient, orderId);
+
+  if (String(order.status || '') !== 'processing') {
+    throw new Error("Order must be in 'processing' state to create shipment.");
+  }
+  if (order.velocity_shipment_id) {
+    throw new Error('Shipment already exists for this order.');
+  }
+  const existingDraft = typeof order.velocity_pending_shipment_id === 'string'
+    ? order.velocity_pending_shipment_id.trim()
+    : '';
+  if (existingDraft) {
+    throw new Error(
+      'A Velocity shipment draft already exists for this order. Assign a courier to generate the AWB, or cancel the draft before creating another.',
+    );
+  }
+
+  const pickupRow = await fetchPickupLocationById(adminClient, pickupLocationId);
+  if (!pickupRow) throw new Error('Pickup location was not found.');
+  const warehouseId = typeof pickupRow.velocity_warehouse_id === 'string' ? pickupRow.velocity_warehouse_id.trim() : '';
+  if (!warehouseId) {
+    throw new Error('Pickup location is not synced with Velocity (missing warehouse_id).');
+  }
+
+  const pickupLocationName = String(pickupRow.warehouse_name || 'Warehouse');
+  const sellerId = typeof pickupRow.seller_id === 'string' ? pickupRow.seller_id : null;
+
+  const addr = (order.shipping_address || {}) as Record<string, unknown>;
+  const method = String(order.payment_method || '').toLowerCase();
+  const paymentMethod = ['razorpay', 'razorpay_upi', 'razorpay_cards', 'online'].includes(method) ? 'PREPAID' : 'COD';
+  const subTotal = Number(order.total_amount || 0);
+
+  const items = buildForwardOrderLineItems(orderItems, subTotal);
+
+  const channelId = getEnvOptional('VELOCITY_CHANNEL_ID');
+
+  const requestPayload: Json = {
+    order_id: `HAT-${orderId.replace(/-/g, '').slice(0, 10).toUpperCase()}`,
+    order_date: new Date(String(order.created_at || nowIso())).toISOString().replace('T', ' ').slice(0, 16),
+    billing_customer_name: String(addr.first_name || addr.name || 'Customer'),
+    billing_last_name: String(addr.last_name || ''),
+    billing_address: [addr.address_line1, addr.address_line2].filter(Boolean).join(', '),
+    billing_city: String(addr.city || ''),
+    billing_pincode: customerPincode,
+    billing_state: String(addr.state || ''),
+    billing_country: 'India',
+    billing_email: String(addr.email || ''),
+    billing_phone: String(addr.phone || ''),
+    shipping_is_billing: true,
+    print_label: true,
+    order_items: items,
+    payment_method: paymentMethod,
+    sub_total: subTotal,
+    cod_collectible: paymentMethod === 'COD' ? subTotal : 0,
+    length,
+    breadth,
+    height,
+    weight,
+    pickup_location: pickupLocationName,
+    warehouse_id: warehouseId,
+    vendor_details: vendorDetailsFromPickupRow(pickupRow, pickupLocationName),
+  };
+
+  if (channelId) requestPayload.channel_id = channelId;
+
+  const apiResult = await callVelocityApi('create_forward_order', endpoint, token, requestPayload);
+  const createDataObj = (apiResult.data || {}) as Record<string, unknown>;
+  const createOut = (createDataObj.payload || createDataObj) as Record<string, unknown>;
+
+  if (apiResult.ok) {
+    const sid = String(createOut.shipment_id || '').trim();
+    if (!sid) {
+      throw new Error('Velocity forward-order succeeded but shipment_id was missing — not saving draft.');
+    }
+    const snap = payload.serviceability_snapshot;
+    const fulfillmentMeta: Record<string, unknown> = {
+      pickup_location_id: pickupLocationId,
+      length,
+      breadth,
+      height,
+      weight,
+      saved_at: nowIso(),
+    };
+    if (snap && typeof snap === 'object' && !Array.isArray(snap)) {
+      const s = snap as Record<string, unknown>;
+      fulfillmentMeta.serviceability = {
+        serviceable: s.serviceable ?? null,
+        carriers: s.carriers ?? null,
+        zone: s.zone ?? null,
+        payment_mode: s.payment_mode ?? null,
+        customer_pincode: s.customer_pincode ?? null,
+        pickup_pincode: s.pickup_pincode ?? null,
+        pickup_location: s.pickup_location ?? null,
+        rates_note: s.rates_note ?? null,
+      };
+    }
+
+    await adminClient.from('orders').update({
+      velocity_pending_shipment_id: sid,
+      velocity_fulfillment: fulfillmentMeta,
+      updated_at: nowIso(),
+      admin_updated_at: nowIso(),
+    }).eq('id', orderId).then(() => {}, () => {});
+  }
+
+  await logVelocityCall(adminClient, {
+    action: 'create_forward_order',
+    requestPayload,
+    responsePayload: apiResult.data,
+    statusCode: apiResult.status,
+    success: apiResult.ok,
+    errorMessage: apiResult.ok ? undefined : 'Forward order creation failed on Velocity',
+    orderId,
+    sellerId,
+  });
+
+  return apiResult;
+}
+
+async function handleAssignCourier(
+  adminClient: ReturnType<typeof createAdminClient>,
+  endpoint: string,
+  token: string,
+  payload: Json,
+) {
+  const internalOrderId = String(payload.order_id || '').trim();
+  if (!internalOrderId) throw new Error('assign_courier requires order_id');
+
+  const { data: orderRow, error: orderErr } = await adminClient
+    .from('orders')
+    .select('id, status, tracking_number, velocity_pending_shipment_id')
+    .eq('id', internalOrderId)
+    .maybeSingle();
+
+  if (orderErr || !orderRow) throw new Error('Order not found');
+  if (String(orderRow.status || '') !== 'processing') {
+    throw new Error("Order must be in 'processing' state to assign courier.");
+  }
+  if (String(orderRow.tracking_number || '').trim()) {
+    throw new Error('AWB already exists for this order.');
+  }
+
+  let shipmentId = String(payload.shipment_id || '').trim();
+  if (!shipmentId) {
+    shipmentId = String(orderRow.velocity_pending_shipment_id || '').trim();
+  }
+  if (!shipmentId) throw new Error('assign_courier requires shipment_id or a saved Velocity draft on the order');
+
+  const carrierId = typeof payload.carrier_id === 'string' ? payload.carrier_id : '';
+  /** Match forward-order (`print_label: true`) so the shipment API returns a printable label URL when supported. */
+  const requestPayload: Json = { shipment_id: shipmentId, carrier_id: carrierId, print_label: true };
+
+  const apiResult = await callVelocityApi('assign_courier', endpoint, token, requestPayload);
+  const dataObj = (apiResult.data || {}) as Record<string, unknown>;
+  const outPayload = (dataObj.payload || dataObj) as Record<string, unknown>;
+
+  if (apiResult.ok) {
+    await adminClient.from('orders').update({
+      status: 'shipped',
+      shipment_status: 'in_transit',
+      shipment_provider: String(outPayload.courier_name || 'Velocity'),
+      tracking_number: String(outPayload.awb_code || ''),
+      velocity_shipment_id: String(outPayload.shipment_id || shipmentId),
+      velocity_awb: String(outPayload.awb_code || ''),
+      velocity_label_url: extractVelocityLabelUrl(outPayload),
+      velocity_carrier_name: String(outPayload.courier_name || ''),
+      velocity_pending_shipment_id: null,
+      velocity_fulfillment: null,
+      shipped_at: nowIso(),
+      updated_at: nowIso(),
+      admin_updated_at: nowIso(),
+    }).eq('id', internalOrderId).then(() => {}, () => {});
+  }
+
+  await logVelocityCall(adminClient, {
+    action: 'assign_courier',
+    requestPayload,
+    responsePayload: apiResult.data,
+    statusCode: apiResult.status,
+    success: apiResult.ok,
+    errorMessage: apiResult.ok ? undefined : 'Assign courier failed',
+    orderId: internalOrderId,
+    sellerId: null,
   });
 
   return apiResult;
@@ -722,25 +1457,110 @@ async function handleTrackOrder(
   token: string,
   payload: Json,
 ) {
-  const orderId = typeof payload.order_id === 'string' ? payload.order_id : null;
-  const apiResult = await callVelocityApi('track_order', endpoint, token, payload);
+  const orderId = typeof payload.order_id === 'string' ? payload.order_id.trim() : null;
+  const p = payload as Record<string, unknown>;
+  const awbDirect = typeof p.awb === 'string' ? p.awb.trim() : '';
+  const trackNum = typeof p.tracking_number === 'string' ? p.tracking_number.trim() : '';
+  const hasAwbs = Array.isArray(p.awbs) && p.awbs.length > 0;
 
-  if (apiResult.ok && orderId) {
-    const { shipmentStatus, awb } = pickOrderTrackingFromResponse(apiResult.data);
-    const patch: Record<string, unknown> = { updated_at: nowIso() };
-    if (shipmentStatus) patch.shipment_status = shipmentStatus;
-    if (awb) patch.velocity_awb = awb;
+  let velocityRequest: Json | null = null;
 
-    await adminClient
+  if (hasAwbs) {
+    velocityRequest = { awbs: p.awbs as unknown[] };
+  } else if (awbDirect || trackNum) {
+    velocityRequest = { awbs: [awbDirect || trackNum] };
+  } else if (orderId) {
+    const { data: row } = await adminClient
       .from('orders')
-      .update(patch)
+      .select('tracking_number, velocity_awb, status, velocity_shipment_id, velocity_pending_shipment_id')
       .eq('id', orderId)
-      .then(() => {}, () => {});
+      .maybeSingle();
+    const awb = String(row?.tracking_number || row?.velocity_awb || '').trim();
+    if (awb) {
+      velocityRequest = { awbs: [awb] };
+    } else {
+      return {
+        ok: false,
+        status: 400,
+        data: {
+          error: 'No AWB on this order yet. Assign a courier in Velocity to generate the waybill, then refresh tracking.',
+        },
+        endpoint,
+      };
+    }
+  } else {
+    const sid = typeof p.shipment_id === 'string' ? p.shipment_id.trim() : '';
+    if (sid) {
+      const { data: row } = await adminClient
+        .from('orders')
+        .select('tracking_number, velocity_awb')
+        .or(`velocity_shipment_id.eq.${sid},velocity_pending_shipment_id.eq.${sid}`)
+        .maybeSingle();
+      const awb = String(row?.tracking_number || row?.velocity_awb || '').trim();
+      if (awb) {
+        velocityRequest = { awbs: [awb] };
+      } else {
+        return {
+          ok: false,
+          status: 400,
+          data: {
+            error:
+              'Tracking uses AWB (order-tracking API requires awbs[]). Complete courier assignment first so the order has a waybill.',
+          },
+          endpoint,
+        };
+      }
+    } else {
+      return {
+        ok: false,
+        status: 400,
+        data: { error: 'track_order requires order_id, awbs[], awb, tracking_number, or shipment_id + saved AWB' },
+        endpoint,
+      };
+    }
+  }
+
+  const apiResult = await callVelocityApi('track_order', endpoint, token, velocityRequest as Json);
+
+  if (apiResult.ok) {
+    const picked = pickOrderTrackingFromResponse(apiResult.data);
+
+    let targetOrderId = orderId;
+    if (!targetOrderId && picked.awb) {
+      const { data: byAwb } = await adminClient
+        .from('orders')
+        .select('id, status')
+        .or(`tracking_number.eq.${picked.awb},velocity_awb.eq.${picked.awb}`)
+        .maybeSingle();
+      targetOrderId = typeof byAwb?.id === 'string' ? byAwb.id : null;
+    }
+
+    if (targetOrderId) {
+      const { data: orderRow } = await adminClient
+        .from('orders')
+        .select('status')
+        .eq('id', targetOrderId)
+        .maybeSingle();
+
+      const patch: Record<string, unknown> = { updated_at: nowIso() };
+      if (picked.shipmentStatus) patch.shipment_status = picked.shipmentStatus;
+      if (picked.awb) {
+        patch.velocity_awb = picked.awb;
+        patch.tracking_number = picked.awb;
+      }
+      if (picked.trackUrl) patch.velocity_tracking_url = picked.trackUrl;
+      if (picked.snapshot) patch.velocity_tracking_snapshot = picked.snapshot;
+      if (picked.labelUrl) patch.velocity_label_url = picked.labelUrl;
+
+      mergeOrderPatchFromShipmentStatus(patch, picked.shipmentStatus, orderRow?.status as string | undefined);
+
+      await adminClient.from('orders').update(patch).eq('id', targetOrderId).then(() => {}, () => {});
+    }
   }
 
   await logVelocityCall(adminClient, {
     action: 'track_order',
-    requestPayload: payload,
+    requestPayload: { ...payload, resolved: velocityRequest },
     responsePayload: apiResult.data,
     statusCode: apiResult.status,
     success: apiResult.ok,
@@ -751,35 +1571,129 @@ async function handleTrackOrder(
   return apiResult;
 }
 
+async function handleCancelVelocityDraft(
+  adminClient: ReturnType<typeof createAdminClient>,
+  endpoint: string,
+  token: string,
+  payload: Json,
+) {
+  const internalOrderId = String(payload.order_id || '').trim();
+  if (!internalOrderId) throw new Error('cancel_velocity_draft requires order_id');
+
+  const { data: orderRow, error: orderErr } = await adminClient
+    .from('orders')
+    .select('id, velocity_pending_shipment_id, tracking_number')
+    .eq('id', internalOrderId)
+    .maybeSingle();
+
+  if (orderErr || !orderRow) throw new Error('Order not found');
+
+  const pending = String(payload.shipment_id || orderRow.velocity_pending_shipment_id || '').trim();
+  if (!pending) {
+    throw new Error('No pending Velocity shipment draft to cancel.');
+  }
+  if (String(orderRow.tracking_number || '').trim()) {
+    throw new Error('This order already has an AWB; cancelling the draft is not applicable.');
+  }
+
+  const requestPayload: Json = { shipment_id: pending };
+  const apiResult = await callVelocityApi('cancel_velocity_draft', endpoint, token, requestPayload);
+
+  if (apiResult.ok) {
+    await adminClient.from('orders').update({
+      velocity_pending_shipment_id: null,
+      velocity_fulfillment: null,
+      updated_at: nowIso(),
+      admin_updated_at: nowIso(),
+    }).eq('id', internalOrderId).then(() => {}, () => {});
+  }
+
+  await logVelocityCall(adminClient, {
+    action: 'cancel_velocity_draft',
+    requestPayload,
+    responsePayload: apiResult.data,
+    statusCode: apiResult.status,
+    success: apiResult.ok,
+    errorMessage: apiResult.ok ? undefined : 'Cancel Velocity draft failed',
+    orderId: internalOrderId,
+  });
+
+  return apiResult;
+}
+
+/**
+ * Velocity POST /cancel-order — docs: body `{ "awbs": ["..."] }` (max 50).
+ * Resolves AWB from the order row, or cancels a forward-order draft (no AWB) via `shipment_id`.
+ */
 async function handleCancelOrder(
   adminClient: ReturnType<typeof createAdminClient>,
   endpoint: string,
   token: string,
   payload: Json,
 ) {
-  const orderId = typeof payload.order_id === 'string' ? payload.order_id : null;
-  const apiResult = await callVelocityApi('cancel_order', endpoint, token, payload);
+  const internalOrderId = String(payload.order_id || '').trim();
+  if (!internalOrderId) throw new Error('cancel_order requires payload.order_id');
 
-  if (apiResult.ok && orderId) {
-    await adminClient
-      .from('orders')
-      .update({
-        status: 'cancelled',
-        shipment_status: 'cancelled',
-        updated_at: nowIso(),
-      })
-      .eq('id', orderId)
-      .then(() => {}, () => {});
+  const { data: row, error: rowErr } = await adminClient
+    .from('orders')
+    .select('id, tracking_number, velocity_awb, velocity_pending_shipment_id')
+    .eq('id', internalOrderId)
+    .maybeSingle();
+
+  if (rowErr || !row) throw new Error('Order not found');
+
+  const awb = String(row.tracking_number || row.velocity_awb || '').trim();
+  const pending = String(payload.shipment_id || row.velocity_pending_shipment_id || '').trim();
+
+  let requestPayload: Json;
+  if (awb) {
+    requestPayload = { awbs: [awb] };
+  } else if (pending) {
+    requestPayload = { shipment_id: pending };
+  } else {
+    const skipped: VelocityApiResult = {
+      ok: true,
+      status: 200,
+      data: { skipped: true, message: 'No Velocity AWB or draft shipment on this order' },
+      endpoint,
+    };
+    await logVelocityCall(adminClient, {
+      action: 'cancel_order',
+      requestPayload: payload,
+      responsePayload: skipped.data,
+      statusCode: 200,
+      success: true,
+      errorMessage: undefined,
+      orderId: internalOrderId,
+    });
+    return skipped;
+  }
+
+  const apiResult = await callVelocityApi('cancel_order', endpoint, token, requestPayload);
+
+  if (apiResult.ok) {
+    const patch: Record<string, unknown> = {
+      updated_at: nowIso(),
+      admin_updated_at: nowIso(),
+    };
+    if (awb) {
+      patch.shipment_status = 'cancelled';
+    }
+    if (row.velocity_pending_shipment_id) {
+      patch.velocity_pending_shipment_id = null;
+      patch.velocity_fulfillment = null;
+    }
+    await adminClient.from('orders').update(patch).eq('id', internalOrderId).then(() => {}, () => {});
   }
 
   await logVelocityCall(adminClient, {
     action: 'cancel_order',
-    requestPayload: payload,
+    requestPayload: { ...payload, resolved: requestPayload },
     responsePayload: apiResult.data,
     statusCode: apiResult.status,
     success: apiResult.ok,
     errorMessage: apiResult.ok ? undefined : 'Cancel order failed',
-    orderId,
+    orderId: internalOrderId,
   });
 
   return apiResult;
@@ -872,48 +1786,87 @@ async function handleLogisticsListingAction(
   return apiResult;
 }
 
+/** Wrapped webhook: `{ action: "webhook_update", payload: { ... } }` — same fields as inbound or legacy flat keys. */
 async function handleWebhookUpdate(
   req: Request,
   adminClient: ReturnType<typeof createAdminClient>,
   payload: Json,
 ) {
-  const configuredSecret = getEnvOptional('VELOCITY_WEBHOOK_SECRET');
-  if (!configuredSecret) {
+  if (!getEnvOptional('VELOCITY_WEBHOOK_SECRET')) {
     return new Response(JSON.stringify({ error: 'Missing VELOCITY_WEBHOOK_SECRET configuration' }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   }
 
-  const incomingSecret = req.headers.get('x-velocity-webhook-secret') || '';
-  if (incomingSecret !== configuredSecret) {
-    return new Response(JSON.stringify({ error: 'Invalid webhook secret' }), {
+  if (!verifyVelocityWebhookSecret(req)) {
+    return new Response(JSON.stringify({ error: 'Invalid webhook authorization' }), {
       status: 401,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   }
 
-  const orderId = typeof payload.order_id === 'string' ? payload.order_id : null;
-  const shipmentStatus = typeof payload.shipment_status === 'string' ? payload.shipment_status : null;
-  const awb = typeof payload.awb_code === 'string' ? payload.awb_code : null;
+  const top = payload as Record<string, unknown>;
+  const data = (top.data && typeof top.data === 'object') ? top.data as Record<string, unknown> : top;
 
-  if (orderId && shipmentStatus) {
+  const externalId =
+    (typeof data.order_external_id === 'string' ? data.order_external_id.trim() : '') ||
+    (typeof data.order_id === 'string' ? data.order_id.trim() : '');
+
+  const shipmentStatus =
+    (typeof data.status === 'string' ? data.status.trim() : '') ||
+    (typeof data.shipment_status === 'string' ? data.shipment_status.trim() : '');
+
+  const awb =
+    (typeof data.tracking_number === 'string' ? data.tracking_number.trim() : '') ||
+    (typeof data.awb_code === 'string' ? data.awb_code.trim() : '') ||
+    (typeof data.awb === 'string' ? data.awb.trim() : '');
+
+  let applied = false;
+
+  if (externalId && (shipmentStatus || awb)) {
+    const { data: orderRow } = await adminClient
+      .from('orders')
+      .select('status')
+      .eq('id', externalId)
+      .maybeSingle();
+
     const patch: Record<string, unknown> = {
-      shipment_status: shipmentStatus,
       updated_at: nowIso(),
     };
-    if (awb) patch.velocity_awb = awb;
+    if (shipmentStatus) patch.shipment_status = shipmentStatus;
+    if (awb) {
+      patch.velocity_awb = awb;
+      patch.tracking_number = awb;
+    }
+    const tu = typeof data.tracking_url === 'string' ? data.tracking_url.trim() : '';
+    if (tu) patch.velocity_tracking_url = tu;
 
-    await adminClient.from('orders').update(patch).eq('id', orderId).then(() => {}, () => {});
+    const labelUrl = extractVelocityLabelUrl(data);
+    if (labelUrl) patch.velocity_label_url = labelUrl;
+
+    const ndrReason =
+      typeof data.ndr_reason === 'string'
+        ? data.ndr_reason.trim()
+        : '';
+    mergeOrderPatchFromShipmentStatus(
+      patch,
+      shipmentStatus || undefined,
+      orderRow?.status as string | undefined,
+      ndrReason ? { carrierReason: ndrReason } : undefined,
+    );
+
+    const { error } = await adminClient.from('orders').update(patch).eq('id', externalId);
+    applied = !error;
   }
 
   await logVelocityCall(adminClient, {
     action: 'webhook_update',
     requestPayload: payload,
-    responsePayload: { applied: Boolean(orderId && shipmentStatus) },
+    responsePayload: { applied, order_id: externalId || null },
     statusCode: 200,
     success: true,
-    orderId,
+    orderId: externalId || null,
   });
 
   return new Response(JSON.stringify({ ok: true }), {
@@ -934,9 +1887,32 @@ Deno.serve(async (req: Request) => {
     });
   }
 
+  const rawBody = await req.text();
+  let parsedRoot: unknown;
+  try {
+    parsedRoot = rawBody ? JSON.parse(rawBody) : null;
+  } catch {
+    return new Response(JSON.stringify({ error: 'Invalid JSON body' }), {
+      status: 400,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+
+  /** Velocity/Shipfast portal webhooks POST `{ event, event_id, data }` — not wrapped in `action`. */
+  if (
+    parsedRoot &&
+    typeof parsedRoot === 'object' &&
+    !Array.isArray(parsedRoot) &&
+    typeof (parsedRoot as Record<string, unknown>).event === 'string' &&
+    'data' in (parsedRoot as Record<string, unknown>)
+  ) {
+    const adminClient = createAdminClient();
+    return await handleShipfastInboundWebhook(req, adminClient, parsedRoot as Record<string, unknown>);
+  }
+
   let body: { action: VelocityAction; payload?: Json };
   try {
-    body = parseActionRequest(await req.json());
+    body = parseActionRequest(parsedRoot);
   } catch (error: unknown) {
     return new Response(JSON.stringify({ error: safeErrorMessage(error, 'Invalid request body.') }), {
       status: 400,
@@ -960,9 +1936,30 @@ Deno.serve(async (req: Request) => {
     return await handleWebhookUpdate(req, adminClient, payload);
   }
 
-  const auth = await requireAdmin(req, adminClient);
+  const auth = await requireOrdersStaffOrAdmin(req, adminClient);
   if (!auth.ok) {
     return auth.response;
+  }
+
+  if (action === 'webhook_health') {
+    return new Response(JSON.stringify({
+      ok: true,
+      action: 'webhook_health',
+      endpoint: '',
+      status: 200,
+      data: {
+        velocity_webhook_secret_configured: Boolean(getEnvOptional('VELOCITY_WEBHOOK_SECRET')),
+        velocity_api_credentials_configured: Boolean(
+          getEnvOptional('VELOCITY_BASE_URL') &&
+            getEnvOptional('VELOCITY_USERNAME') &&
+            getEnvOptional('VELOCITY_PASSWORD'),
+        ),
+      },
+      actor_id: auth.userId,
+    }), {
+      status: 200,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
   }
 
   let velocityBaseUrl: string;
@@ -1002,11 +1999,20 @@ Deno.serve(async (req: Request) => {
       case 'cancel_order':
         result = await handleCancelOrder(adminClient, endpoint, token, payload);
         break;
+      case 'cancel_velocity_draft':
+        result = await handleCancelVelocityDraft(adminClient, endpoint, token, payload);
+        break;
       case 'check_serviceability':
-        result = await handleCheckServiceability(adminClient, endpoint, token, payload);
+        result = await handleCheckServiceability(adminClient, endpoint, endpoints.calculate_rates, token, payload);
         break;
       case 'create_order':
         result = await handleCreateOrder(adminClient, endpoint, token, payload);
+        break;
+      case 'create_forward_order':
+        result = await handleCreateForwardOrder(adminClient, endpoint, token, payload);
+        break;
+      case 'assign_courier':
+        result = await handleAssignCourier(adminClient, endpoint, token, payload);
         break;
       case 'get_reports':
       case 'list_shipments':

@@ -134,8 +134,11 @@ export default function Orders() {
                   const payStatus = String(order.payment_status || 'pending').toLowerCase();
 
                   return (
-                    <Link key={order.id} to={`/order/${order.id}`} className="block">
-                      <div className="bg-white rounded-xl border border-outline-variant/15 p-4 hover:border-outline-variant/30 hover:shadow-sm transition-all group">
+                    <div
+                      key={order.id}
+                      className="bg-white rounded-xl border border-outline-variant/15 overflow-hidden hover:border-outline-variant/30 hover:shadow-sm transition-all group"
+                    >
+                    <Link to={`/order/${order.id}`} className="block p-4">
                         <div className="flex items-center gap-3">
 
                           {/* Thumbnail */}
@@ -181,16 +184,6 @@ export default function Orders() {
                           <span className="material-symbols-outlined text-on-surface-variant/20 group-hover:text-primary transition-colors text-[18px]">chevron_right</span>
                         </div>
 
-                        {/* Tracking bar (if shipped) */}
-                        {order.tracking_number && (
-                          <div className="mt-3 pt-3 border-t border-outline-variant/10 flex items-center gap-2">
-                            <span className="material-symbols-outlined text-[14px] text-secondary">local_shipping</span>
-                            <span className="text-[11px] font-semibold text-on-surface-variant/60 font-body">
-                              {order.shipment_provider || 'AWB'}: <span className="font-mono text-primary">{order.tracking_number}</span>
-                            </span>
-                          </div>
-                        )}
-
                         {/* Mobile status badge */}
                         <div className="sm:hidden mt-2">
                           <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold border font-body ${statusConfig.style}`}>
@@ -198,8 +191,26 @@ export default function Orders() {
                             {statusConfig.label}
                           </span>
                         </div>
-                      </div>
                     </Link>
+                    {order.tracking_number && (
+                      <div className="px-4 pb-3 -mt-0.5 border-t border-outline-variant/10 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 bg-surface-container-low/30">
+                        <div className="flex items-center gap-2 pt-3">
+                          <span className="material-symbols-outlined text-[14px] text-secondary shrink-0">local_shipping</span>
+                          <span className="text-[11px] font-semibold text-on-surface-variant/70 font-body">
+                            {order.shipment_provider || 'AWB'}: <span className="font-mono text-primary">{order.tracking_number}</span>
+                          </span>
+                        </div>
+                        <Link
+                          to={`/track/${encodeURIComponent(order.tracking_number)}`}
+                          className="inline-flex items-center justify-center gap-1.5 shrink-0 rounded-lg px-3 py-2 text-[11px] font-bold text-secondary bg-white border border-secondary/20 hover:bg-secondary/10 transition-colors sm:mt-3 self-end sm:self-center"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <span className="material-symbols-outlined text-[14px]">travel_explore</span>
+                          Tracking page
+                        </Link>
+                      </div>
+                    )}
+                    </div>
                   );
                 })}
               </div>
