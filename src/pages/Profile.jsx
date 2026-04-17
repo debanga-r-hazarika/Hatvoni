@@ -229,9 +229,13 @@ export default function Profile() {
   const sidebarLinks = [
     { label: 'Personal Details', href: '/profile', icon: 'person', active: true },
     { label: 'My Orders', href: '/orders', icon: 'package_2', active: false },
+    { label: 'Support', href: '/support', icon: 'support_agent', active: false },
     { label: 'Wishlist', href: '/wishlist', icon: 'favorite', active: false },
     ...(isSeller ? [{ label: 'Seller Panel', href: '/seller', icon: 'storefront', active: false, admin: true }] : []),
     ...(isAdmin ? [{ label: 'Admin Panel', href: '/admin', icon: 'admin_panel_settings', active: false, admin: true }] : []),
+    ...((isAdmin || employeeModules.includes('support'))
+      ? [{ label: 'Support Queue', href: '/admin/support', icon: 'support_agent', active: false, admin: true }]
+      : []),
     ...(!isAdmin && isEmployee ? [{ label: 'Staff Panel', href: employeeAdminLink, icon: 'badge', active: false, admin: true }] : []),
     { label: 'Log Out', onClick: handleLogout, icon: 'logout', active: false, danger: true },
   ];

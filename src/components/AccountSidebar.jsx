@@ -20,6 +20,7 @@ export default function AccountSidebar() {
   const links = [
     { label: 'Profile', href: '/profile', icon: 'person' },
     { label: 'Orders', href: '/orders', icon: 'package_2' },
+    { label: 'Support', href: '/support', icon: 'support_agent' },
     { label: 'Wishlist', href: '/wishlist', icon: 'favorite' },
     ...(profile?.is_seller ? [{ label: 'Seller', href: '/seller', icon: 'storefront', special: true }] : []),
     ...(profile?.is_admin ? [{ label: 'Admin', href: '/admin', icon: 'admin_panel_settings', special: true }] : []),

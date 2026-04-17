@@ -20,6 +20,8 @@ export const AuthProvider = ({ children }) => {
   const [employeeModules, setEmployeeModules] = useState([]);
   const [loading, setLoading] = useState(true);
 
+  const normalizeModule = (moduleName) => String(moduleName || '').trim().toLowerCase();
+
   const fetchEmployeeModules = async (userId) => {
     if (!userId) {
       setIsEmployee(false);
@@ -28,7 +30,9 @@ export const AuthProvider = ({ children }) => {
     }
     try {
       const { data } = await supabase.rpc('get_my_employee_modules');
-      const modules = Array.isArray(data) ? data : [];
+      const modules = Array.isArray(data)
+        ? [...new Set(data.map(normalizeModule).filter(Boolean))]
+        : [];
       setIsEmployee(modules.length > 0);
       setEmployeeModules(modules);
     } catch {
@@ -193,7 +197,7 @@ export const AuthProvider = ({ children }) => {
     isSeller,
     isEmployee,
     employeeModules,
-    hasModule: (mod) => isAdmin || employeeModules.includes(mod),
+    hasModule: (mod) => isAdmin || employeeModules.includes(normalizeModule(mod)),
     loading,
     signUp,
     signIn,

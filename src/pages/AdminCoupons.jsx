@@ -364,7 +364,7 @@ export default function AdminCoupons() {
     );
   }
 
-  if (!profile?.is_admin) {
+  if (!isAdmin && !hasModule('coupons')) {
     return (
       <div className="min-h-screen grid place-items-center">
         <div className="text-center">

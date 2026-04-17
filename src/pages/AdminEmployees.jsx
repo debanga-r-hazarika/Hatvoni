@@ -6,6 +6,8 @@ import { supabase } from '../lib/supabase';
 // All modules that can be assigned to an employee
 export const ALL_MODULES = [
   { id: 'orders',    label: 'Orders',    icon: 'package_2' },
+  { id: 'logistics', label: 'Logistics', icon: 'local_shipping' },
+  { id: 'support',   label: 'Support',   icon: 'support_agent' },
   { id: 'inventory', label: 'Inventory', icon: 'inventory_2' },
   { id: 'coupons',   label: 'Coupons',   icon: 'sell' },
   { id: 'customers', label: 'Customers', icon: 'group' },

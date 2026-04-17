@@ -5,7 +5,7 @@ import { supabase } from '../lib/supabase';
 import PickupLocationModal from '../components/admin/PickupLocationModal';
 
 export default function AdminSellers() {
-  const { isAdmin, loading } = useAuth();
+  const { isAdmin, hasModule, loading } = useAuth();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
 
@@ -55,10 +55,10 @@ export default function AdminSellers() {
   }, []);
 
   useEffect(() => {
-    if (!loading && !isAdmin) {
+    if (!loading && !isAdmin && !hasModule('sellers')) {
       navigate('/');
     }
-  }, [isAdmin, loading, navigate]);
+  }, [isAdmin, hasModule, loading, navigate]);
 
   const fetchSellerData = useCallback(async () => {
     setLoadingState(true);
@@ -115,9 +115,9 @@ export default function AdminSellers() {
   }, [showError]);
 
   useEffect(() => {
-    if (!isAdmin) return;
+    if (!isAdmin && !hasModule('sellers')) return;
     fetchSellerData();
-  }, [fetchSellerData, isAdmin]);
+  }, [fetchSellerData, hasModule, isAdmin]);
 
   useEffect(() => {
     const sellerId = searchParams.get('seller');

@@ -95,7 +95,7 @@ function exportCsv(filename, rows) {
 }
 
 export default function AdminLogistics() {
-  const { isAdmin, loading } = useAuth();
+  const { isAdmin, hasModule, loading } = useAuth();
   const navigate = useNavigate();
 
   const [reportsLoading, setReportsLoading] = useState(false);
@@ -110,8 +110,8 @@ export default function AdminLogistics() {
   const [filters, setFilters] = useState(initialFilters);
 
   useEffect(() => {
-    if (!loading && !isAdmin) navigate('/');
-  }, [isAdmin, loading, navigate]);
+    if (!loading && !isAdmin && !hasModule('logistics')) navigate('/');
+  }, [isAdmin, hasModule, loading, navigate]);
 
   const callOrchestrator = async (action, payload = {}) => {
     const { data: sessionData } = await supabase.auth.getSession();
@@ -247,14 +247,15 @@ export default function AdminLogistics() {
   };
 
   useEffect(() => {
-    if (!isAdmin) return;
+    if (!isAdmin && !hasModule('logistics')) return;
     loadReports();
     loadShipments();
     loadReturns();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAdmin]);
+  }, [hasModule, isAdmin]);
 
   if (loading) return null;
+  if (!isAdmin && !hasModule('logistics')) return null;
 
   return (
     <div className="min-h-screen bg-surface pt-28 pb-16">
